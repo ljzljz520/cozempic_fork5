@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -28,8 +29,10 @@ from cozempic.digest import (
     clear_digest_store,
     extract_corrections,
     load_digest_store,
+    load_scoped,
     save_digest_store,
     score_rule,
+    scope_paths,
     show_digest,
     sync_to_memdir,
     update_digest,
@@ -37,6 +40,16 @@ from cozempic.digest import (
 from cozempic.helpers import is_protected, msg_bytes
 
 import cozempic.strategies  # noqa: F401
+
+
+@contextlib.contextmanager
+def _default_config_env():
+    """Pin CLAUDE_CONFIG_DIR unset so the scope config-key is the deterministic
+    ``default`` regardless of the test runner's environment."""
+    with patch.dict(os.environ, {
+        k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"
+    }):
+        yield
 
 
 def _import_system_noise():
@@ -468,17 +481,15 @@ class TestUpdateDigest(unittest.TestCase):
             make_user(3, "always use Edit for existing files"),
         ]
 
-        digest_file = self.tmpdir / "behavioral-digest.json"
-        digest_md = self.tmpdir / "behavioral-digest.md"
-
-        with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), \
-             patch("cozempic.digest.DIGEST_FILE", digest_file), \
-             patch("cozempic.digest.DIGEST_MD_FILE", digest_md):
+        # Persistence is now per-scope: scopes/<config-key>/<project-slug>.json
+        # under DIGEST_DIR, not the legacy global behavioral-digest.json.
+        with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), _default_config_env():
+            own_json = scope_paths("/test").own_json
             added, upvoted, rejected = update_digest(messages, project_dir="/test")
             self.assertGreater(added, 0)
 
-            # Verify persisted
-            data = json.loads(digest_file.read_text())
+            # Verify persisted in the PROJECT scope
+            data = json.loads(own_json.read_text())
             self.assertGreater(len(data["strategy_rules"]), 0)
 
 
@@ -828,14 +839,11 @@ class TestAdmissionNoAutoActivate(unittest.TestCase):
         active rule — the repetition gate must be honoured."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            digest_file = tmp_path / "behavioral-digest.json"
-            digest_md = tmp_path / "behavioral-digest.md"
             messages = [make_user(0, "don't add Co-Authored-By to commits")]
-            with patch("cozempic.digest.DIGEST_DIR", tmp_path), \
-                 patch("cozempic.digest.DIGEST_FILE", digest_file), \
-                 patch("cozempic.digest.DIGEST_MD_FILE", digest_md):
+            with patch("cozempic.digest.DIGEST_DIR", tmp_path), _default_config_env():
                 update_digest(messages, project_dir="/test")
-                store = load_digest_store("/test")
+                store = load_scoped("/test").own
+                self.assertEqual(len(store.strategy_rules), 1)
                 active = store.active_rules()
                 self.assertEqual(len(active), 0,
                                  "single-occurrence explicit correction must not auto-activate")
@@ -2263,8 +2271,8 @@ class TestPolishV2_Bug9PersistOnRejected(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def _seed_store(self, session_id: str, updated: str) -> None:
-        """Write a baseline digest file with a known session_id and timestamp."""
+    def _seed_store(self, target: Path, session_id: str, updated: str) -> None:
+        """Write a baseline project-scope store with known session_id/timestamp."""
         payload = {
             "version": 1,
             "project": "/test",
@@ -2273,7 +2281,13 @@ class TestPolishV2_Bug9PersistOnRejected(unittest.TestCase):
             "strategy_rules": [],
             "failure_patterns": [],
         }
-        self.digest_file.write_text(json.dumps(payload))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload))
+
+    def _scoped_paths(self):
+        # Must resolve UNDER the patched DIGEST_DIR, or seeds land in real HOME.
+        with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), _default_config_env():
+            return scope_paths("/test")
 
     def test_rejected_only_persists_new_session_id(self):
         """Pre-seed with session_id='old'. Feed messages that produce zero
@@ -2281,7 +2295,9 @@ class TestPolishV2_Bug9PersistOnRejected(unittest.TestCase):
         session_id MUST be 'new' — currently dropped because persist gate
         skips save when added+upvoted==0.
         """
-        self._seed_store(session_id="old", updated="2020-01-01T00:00:00+00:00")
+        paths = self._scoped_paths()
+        self._seed_store(paths.own_json, session_id="old",
+                         updated="2020-01-01T00:00:00+00:00")
 
         # Messages that pass extract_corrections but are rejected by admit_rule
         # are hard to fabricate deterministically. Use messages that produce
@@ -2290,15 +2306,13 @@ class TestPolishV2_Bug9PersistOnRejected(unittest.TestCase):
         # Use a noise-only message so extract_corrections returns 0 candidates.
         messages = [make_user(0, "<system-reminder>noise</system-reminder>")]
 
-        with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), \
-             patch("cozempic.digest.DIGEST_FILE", self.digest_file), \
-             patch("cozempic.digest.DIGEST_MD_FILE", self.digest_md):
+        with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), _default_config_env():
             added, upvoted, rejected = update_digest(
                 messages, project_dir="/test", session_id="new"
             )
             self.assertEqual((added, upvoted), (0, 0))
 
-            data = json.loads(self.digest_file.read_text())
+            data = json.loads(paths.own_json.read_text())
             self.assertEqual(
                 data["session_id"], "new",
                 "session_id was mutated in memory but not persisted when all "
@@ -2310,16 +2324,16 @@ class TestPolishV2_Bug9PersistOnRejected(unittest.TestCase):
         on-disk `updated` timestamp must advance past 2020. Currently the file
         stays at 2020 because save_digest_store is never called.
         """
-        self._seed_store(session_id="s1", updated="2020-01-01T00:00:00+00:00")
+        paths = self._scoped_paths()
+        self._seed_store(paths.own_json, session_id="s1",
+                         updated="2020-01-01T00:00:00+00:00")
 
         messages = [make_user(0, "<tag>noise</tag>")]
 
-        with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), \
-             patch("cozempic.digest.DIGEST_FILE", self.digest_file), \
-             patch("cozempic.digest.DIGEST_MD_FILE", self.digest_md):
+        with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), _default_config_env():
             update_digest(messages, project_dir="/test", session_id="s1")
 
-            data = json.loads(self.digest_file.read_text())
+            data = json.loads(paths.own_json.read_text())
             self.assertGreater(
                 data["updated"], "2020-01-01T99:99",
                 "updated timestamp not refreshed on rejected-only run — BUG-9",
@@ -2329,16 +2343,16 @@ class TestPolishV2_Bug9PersistOnRejected(unittest.TestCase):
         """Regression: with empty `messages`, update_digest must not raise
         and must still persist the caller's session_id. Zero candidates is
         a valid corner case (quiet session, no user turns)."""
-        self._seed_store(session_id="s0", updated="2020-01-01T00:00:00+00:00")
+        paths = self._scoped_paths()
+        self._seed_store(paths.own_json, session_id="s0",
+                         updated="2020-01-01T00:00:00+00:00")
 
-        with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), \
-             patch("cozempic.digest.DIGEST_FILE", self.digest_file), \
-             patch("cozempic.digest.DIGEST_MD_FILE", self.digest_md):
+        with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), _default_config_env():
             added, upvoted, rejected = update_digest(
                 [], project_dir="/test", session_id="s0-new"
             )
             self.assertEqual((added, upvoted, rejected), (0, 0, 0))
-            data = json.loads(self.digest_file.read_text())
+            data = json.loads(paths.own_json.read_text())
             self.assertEqual(
                 data["session_id"], "s0-new",
                 "zero-candidate run dropped session_id — BUG-9 regression",
@@ -2746,9 +2760,8 @@ class TestPolishV2_UpdateDigestSaveIoSafe(unittest.TestCase):
         gracefully, NOT raise PermissionError."""
         from cozempic.digest import update_digest
         with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), \
-             patch("cozempic.digest.DIGEST_FILE", self.digest_file), \
-             patch("cozempic.digest.DIGEST_MD_FILE", self.digest_md), \
-             patch("cozempic.digest.save_digest_store",
+             _default_config_env(), \
+             patch("cozempic.digest.save_scoped",
                    side_effect=PermissionError("readonly")):
             # Must not raise
             result = update_digest([], project_dir="/test", session_id="s1")
@@ -2758,9 +2771,8 @@ class TestPolishV2_UpdateDigestSaveIoSafe(unittest.TestCase):
         """OSError from save (disk full, FS error) also caught."""
         from cozempic.digest import update_digest
         with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), \
-             patch("cozempic.digest.DIGEST_FILE", self.digest_file), \
-             patch("cozempic.digest.DIGEST_MD_FILE", self.digest_md), \
-             patch("cozempic.digest.save_digest_store",
+             _default_config_env(), \
+             patch("cozempic.digest.save_scoped",
                    side_effect=OSError("disk full")):
             result = update_digest([], project_dir="/test", session_id="s1")
             self.assertEqual(result, (0, 0, 0))
@@ -2771,13 +2783,12 @@ class TestPolishV2_UpdateDigestSaveIoSafe(unittest.TestCase):
         conditional on admission outcomes)."""
         from cozempic.digest import update_digest
         with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), \
-             patch("cozempic.digest.DIGEST_FILE", self.digest_file), \
-             patch("cozempic.digest.DIGEST_MD_FILE", self.digest_md), \
-             patch("cozempic.digest.save_digest_store") as mock_save:
+             _default_config_env(), \
+             patch("cozempic.digest.save_scoped") as mock_save:
             update_digest([], project_dir="/test", session_id="s1")
             self.assertTrue(
                 mock_save.called,
-                "save_digest_store was not called — BUG-9 regression",
+                "save_scoped was not called — BUG-9 regression",
             )
 
 
@@ -3102,22 +3113,25 @@ class TestDigestInjectMessage(unittest.TestCase):
         from types import SimpleNamespace
         import io
         from cozempic.cli import cmd_digest
-        store = _MM()
-        store.is_empty.return_value = False
-        store.active_rules.return_value = active
+        own = _MM()
+        own.active_rules.return_value = active
+        shared = _MM()
+        shared.active_rules.return_value = []
+        scoped = SimpleNamespace(own=own, shared=shared, active_shared=lambda: [])
         buf = io.StringIO()
-        with patch("cozempic.digest.load_digest_store", return_value=store), \
+        with patch("cozempic.digest.load_scoped", return_value=scoped), \
              patch("cozempic.digest.sync_to_memdir", return_value=synced), \
              patch("cozempic.digest._get_memdir", return_value=memdir), \
-             patch("cozempic.digest.save_digest_store"), \
+             patch("cozempic.digest.save_scoped"), \
              patch("sys.stdout", buf):
-            cmd_digest(SimpleNamespace(digest_action="inject", cwd="/x"))
+            cmd_digest(SimpleNamespace(digest_action="inject", cwd="/x",
+                                       session=None, shared=False, rule_ids=[]))
         return buf.getvalue()
 
     def test_no_active_rules(self):
         # synced==0 with no active rules → accurate, regardless of dir state
         out = self._run(None, 0, [])
-        self.assertIn("No active rules", out)
+        self.assertIn("No rules to inject", out)
         self.assertNotIn("not created", out)
 
     def test_active_rules_but_no_memdir(self):
@@ -3125,7 +3139,7 @@ class TestDigestInjectMessage(unittest.TestCase):
         # the old "No active rules" / "Could not find" mislabel
         out = self._run(None, 0, ["rule"])
         self.assertIn("not created", out)
-        self.assertNotIn("No active rules", out)
+        self.assertNotIn("No rules to inject", out)
 
     def test_synced_count(self):
         out = self._run(Path("/x/memory"), 3, ["rule"])

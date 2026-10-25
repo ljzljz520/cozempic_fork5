@@ -644,7 +644,9 @@ class TestDigestSessionResolution:
         fake_path = Path("/fake/abc123.jsonl")
         # _digest_session does `from .session import ..., resolve_session` locally,
         # so patch the source module (cozempic.session) not the cli top-level binding.
-        with patch("cozempic.session.resolve_session", return_value=fake_path) as mock_rs:
+        # The scope-conflict guard is covered separately in test_digest_isolation.
+        with patch("cozempic.session.resolve_session", return_value=fake_path) as mock_rs, \
+             patch("cozempic.digest.assert_session_in_scope"):
             path, session_id, cwd = _digest_session(self._make_args(session="abc123"))
         mock_rs.assert_called_once_with("abc123")
         assert path == fake_path
@@ -652,14 +654,16 @@ class TestDigestSessionResolution:
     def test_uuid_arg_session_id_from_stem(self):
         """session_id must be derived from path.stem (the UUID)."""
         fake_path = Path("/fake/abc123.jsonl")
-        with patch("cozempic.session.resolve_session", return_value=fake_path):
+        with patch("cozempic.session.resolve_session", return_value=fake_path), \
+             patch("cozempic.digest.assert_session_in_scope"):
             path, session_id, cwd = _digest_session(self._make_args(session="abc123"))
         assert session_id == "abc123", f"expected 'abc123', got {session_id!r}"
 
     def test_path_arg_resolves_correctly(self):
         """Explicit file path → resolve_session returns it, stem extracted."""
         fake_path = Path("/real/path/uuid-val.jsonl")
-        with patch("cozempic.session.resolve_session", return_value=fake_path):
+        with patch("cozempic.session.resolve_session", return_value=fake_path), \
+             patch("cozempic.digest.assert_session_in_scope"):
             path, session_id, cwd = _digest_session(
                 self._make_args(session="/real/path/uuid-val.jsonl")
             )
@@ -671,7 +675,8 @@ class TestDigestSessionResolution:
         fake_sess = {"path": Path("/x/sess.jsonl"), "session_id": "sess"}
         # _digest_session does a local `from .session import find_current_session`,
         # so patch the source module (cozempic.session) not the cli binding.
-        with patch("cozempic.session.find_current_session", return_value=fake_sess):
+        with patch("cozempic.session.find_current_session", return_value=fake_sess), \
+             patch("cozempic.digest.assert_session_in_scope"):
             path, session_id, cwd = _digest_session(self._make_args(session=None))
         assert path == Path("/x/sess.jsonl")
         assert session_id == "sess"
@@ -691,7 +696,8 @@ class TestDigestSessionResolution:
         C3: keeps both paths consistent."""
         fake_sess = {"path": Path("/y/curr.jsonl"), "session_id": "curr"}
         with patch("cozempic.session.find_current_session", return_value=fake_sess) as mock_fc, \
-             patch("cozempic.session.resolve_session") as mock_rs:
+             patch("cozempic.session.resolve_session") as mock_rs, \
+             patch("cozempic.digest.assert_session_in_scope"):
             path, session_id, cwd = _digest_session(self._make_args(session="current"))
         # Must use find_current_session (cwd-based), NOT resolve_session
         mock_fc.assert_called_once()
@@ -710,7 +716,8 @@ class TestDigestSessionResolution:
         Spy asserts keyword `strict=True` is passed; no behavior gap if omitted.
         """
         fake_sess = {"path": Path("/z/strict.jsonl"), "session_id": "strict-sess"}
-        with patch("cozempic.session.find_current_session", return_value=fake_sess) as mock_fc:
+        with patch("cozempic.session.find_current_session", return_value=fake_sess) as mock_fc, \
+             patch("cozempic.digest.assert_session_in_scope"):
             _digest_session(self._make_args(session=None))
 
         mock_fc.assert_called_once()

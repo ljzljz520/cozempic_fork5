@@ -14,14 +14,15 @@ from cozempic.digest import (
     DigestStore,
     build_injection_text,
     flush_digest,
-    load_digest_store,
+    load_scoped,
     recover_digest,
-    save_digest_store,
+    scope_paths,
     sync_to_memdir,
 )
 from cozempic.helpers import msg_bytes
 
 import cozempic.strategies  # noqa: F401
+from tests.test_digest import _default_config_env
 
 
 def make_message(line_idx: int, msg: dict) -> tuple[int, dict, int]:
@@ -173,30 +174,26 @@ class TestFlushRecover(unittest.TestCase):
             make_assistant(2, "I'll add Co-Authored-By again"),
             make_user(3, "don't add Co-Authored-By to commits"),
         ]
-        digest_file = self.tmpdir / "behavioral-digest.json"
-        digest_md = self.tmpdir / "behavioral-digest.md"
 
         with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), \
-             patch("cozempic.digest.DIGEST_FILE", digest_file), \
-             patch("cozempic.digest.DIGEST_MD_FILE", digest_md), \
+             _default_config_env(), \
              patch("cozempic.digest._get_memdir", return_value=self.mem_dir):
+            own_json = scope_paths("/test").own_json
             added, upvoted, rejected = flush_digest(messages, project_dir="/test")
             self.assertGreater(added + upvoted, 0)
-            self.assertTrue(digest_file.exists())
+            self.assertTrue(own_json.exists())
             # Memdir should have been synced too (rule promoted to active via 2nd occurrence)
             digest_mem = self.mem_dir / "cozempic_digest.md"
             self.assertTrue(digest_mem.exists())
 
     def test_recover_syncs_to_memdir(self):
-        digest_file = self.tmpdir / "behavioral-digest.json"
-        digest_md = self.tmpdir / "behavioral-digest.md"
-
         store = _make_store_with_rules()
         with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), \
-             patch("cozempic.digest.DIGEST_FILE", digest_file), \
-             patch("cozempic.digest.DIGEST_MD_FILE", digest_md), \
+             _default_config_env(), \
              patch("cozempic.digest._get_memdir", return_value=self.mem_dir):
-            save_digest_store(store)
+            paths = scope_paths("/test")
+            from cozempic.digest import _write_store_file
+            _write_store_file(store, paths.own_json, paths.own_md)
             synced = recover_digest(project_dir="/test")
             self.assertGreater(synced, 0)
             content = (self.mem_dir / "cozempic_digest.md").read_text()
@@ -208,12 +205,8 @@ class TestFlushRecover(unittest.TestCase):
         Post-BUG-4 fix: rules start pending, promoted to active via PROMOTION_COUNT=2.
         Test uses 2 occurrences of the same correction to trigger promotion.
         """
-        digest_file = self.tmpdir / "behavioral-digest.json"
-        digest_md = self.tmpdir / "behavioral-digest.md"
-
         with patch("cozempic.digest.DIGEST_DIR", self.tmpdir), \
-             patch("cozempic.digest.DIGEST_FILE", digest_file), \
-             patch("cozempic.digest.DIGEST_MD_FILE", digest_md), \
+             _default_config_env(), \
              patch("cozempic.digest._get_memdir", return_value=self.mem_dir):
 
             # Flush: extract corrections (2 occurrences → promote via upvote)
@@ -226,7 +219,7 @@ class TestFlushRecover(unittest.TestCase):
             flush_digest(messages, project_dir="/test")
 
             # Verify active after 2nd occurrence (PROMOTION_COUNT=2 threshold met)
-            store = load_digest_store("/test")
+            store = load_scoped("/test").own
             self.assertGreater(len(store.active_rules()), 0)
 
             # Verify memdir synced

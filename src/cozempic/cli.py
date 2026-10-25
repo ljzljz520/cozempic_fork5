@@ -1588,9 +1588,11 @@ def cmd_remind(args):
     # text and this is emitted into Claude's context via the PostToolUse hook, so a
     # multi-line / markdown-structured rule could inject instructions (sibling of
     # the digest injection fix; the #123 fix-one-miss-the-sibling lesson).
-    from .digest import load_digest_store, _sanitize_for_injection
-    store = load_digest_store()
-    active = store.active_rules()
+    # Scope-aware: current project's own rules first, then explicitly-shared
+    # rules of the active config — never other projects' private rules.
+    from .digest import load_scoped, _sanitize_for_injection
+    scoped = load_scoped()
+    active = scoped.active_own() + scoped.active_shared()
     if active:
         for r in active[:5]:
             lines.append(f"  [{r.id}|{r.scope}] {_sanitize_for_injection(r.rule)}")
@@ -1661,9 +1663,16 @@ def _digest_session(args):
       - explicit UUID / UUID prefix / file path → resolve_session(session_arg);
                               session_id recovered from resolved path stem.
 
+    Before returning, verifies the resolved session belongs to the SAME project
+    scope as --cwd (project slug AND active Claude config dir). A mismatch is a
+    scope-conflict error (exit 2) — extracting project A's corrections into
+    project B's store is the cross-project contamination the isolation rules
+    forbid.
+
     Returns (path, session_id, cwd).
     """
     from .session import find_current_session, resolve_session
+    from .digest import DigestScopeConflict, assert_session_in_scope
     cwd = getattr(args, "cwd", None) or os.getcwd()
     session_arg = getattr(args, "session", None)
     if not session_arg or session_arg == "current":
@@ -1671,7 +1680,7 @@ def _digest_session(args):
         # consistent with how the rest of cli.py resolves the current session.
         # Routing "current" through resolve_session() would invoke process-detection
         # (a different strategy from slug-match) — not what we want here.
-        # strict=True: digest flush/inject are write operations — injecting rules
+        # strict=True: digest flush/update are write operations — injecting rules
         # into an unrelated session's JSONL is a context-contamination risk.
         sess = find_current_session(cwd, strict=True)
         if not sess:
@@ -1679,25 +1688,35 @@ def _digest_session(args):
             # and all other error paths in cli.py.
             print("No active session found.", file=sys.stderr)
             sys.exit(1)
-        return sess["path"], sess.get("session_id", ""), cwd
-    # resolve_session handles: explicit path, UUID, UUID prefix
-    resolved = resolve_session(session_arg)
-    session_id = resolved.stem  # filename stem IS the session UUID
+        resolved, session_id = sess["path"], sess.get("session_id", "")
+    else:
+        # resolve_session handles: explicit path, UUID, UUID prefix
+        resolved = resolve_session(session_arg)
+        session_id = resolved.stem  # filename stem IS the session UUID
+    try:
+        assert_session_in_scope(resolved, cwd)
+    except DigestScopeConflict as e:
+        # Distinct exit code (2) from "no session" (1): this is a caller-fixable
+        # scope mismatch, and hooks must be able to tell them apart.
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
     return resolved, session_id, cwd
 
 
 def cmd_digest(args):
     from .digest import (
-        clear_digest_store, flush_digest,
-        load_digest_store, recover_digest,
-        save_digest_store, show_digest, update_digest,
+        adopt_quarantined, clear_scope, flush_digest,
+        load_scoped, quarantined_rule_count, recover_digest, save_scoped,
+        share_rules, show_digest, sync_to_memdir,
+        unshare_rules, update_digest, _get_memdir,
     )
     from .session import load_messages, save_messages
 
     action = getattr(args, "digest_action", "show") or "show"
+    cwd = getattr(args, "cwd", None) or os.getcwd()
 
     if action == "show":
-        print(show_digest())
+        print(show_digest(cwd))
 
     elif action == "update":
         session_path, session_id, cwd = _digest_session(args)
@@ -1708,8 +1727,64 @@ def cmd_digest(args):
         print(f"Digest updated: {added} new, {upvoted} reinforced, {rejected} rejected.")
 
     elif action == "clear":
-        clear_digest_store()
-        print("Behavioral digest cleared.")
+        result = clear_scope(cwd, include_shared=bool(getattr(args, "shared", False)))
+        parts = []
+        if result.store_files:
+            parts.append(f"{result.store_files} scope store file(s)")
+        if result.memfile_removed:
+            parts.append("injected memory file")
+        if result.index_entry_pruned:
+            parts.append("MEMORY.md index entry")
+        if result.shared_cleared:
+            parts.append("config shared store")
+        if parts:
+            print(f"Behavioral digest cleared for this project ({'; '.join(parts)}).")
+        else:
+            print("No behavioral digest data in this project scope to clear.")
+        print("User-owned memory files and MEMORY.md entries were preserved.")
+
+    elif action == "share":
+        ids = getattr(args, "rule_ids", None) or []
+        if not ids:
+            print("Error: specify one or more rule IDs to share, e.g. "
+                  "`cozempic digest share R001 R002`.", file=sys.stderr)
+            sys.exit(2)
+        try:
+            confirmed = share_rules(cwd, ids)
+        except KeyError as e:
+            print(f"Error: {e.args[0]}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Shared across this config's projects: {', '.join(confirmed)}.")
+
+    elif action == "unshare":
+        ids = getattr(args, "rule_ids", None) or []
+        if not ids:
+            print("Error: specify one or more shared rule IDs to revoke, e.g. "
+                  "`cozempic digest unshare R001`.", file=sys.stderr)
+            sys.exit(2)
+        try:
+            removed = unshare_rules(cwd, ids)
+        except KeyError as e:
+            print(f"Error: {e.args[0]}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Revoked shared rules: {', '.join(removed)}. Project copies kept.")
+
+    elif action == "adopt":
+        into_shared = bool(getattr(args, "shared", False))
+        n = adopt_quarantined(cwd, into_shared=into_shared)
+        where = "the config shared store" if into_shared else "this project"
+        remaining = quarantined_rule_count()
+        if n:
+            print(f"Adopted {n} quarantined rule(s) into {where}.")
+        if remaining:
+            print(
+                f"{remaining} quarantined rule(s) did not pass the admission "
+                "gate and were KEPT in quarantine (nothing was deleted). "
+                "Review them and run adopt again, or remove the quarantine "
+                "directory manually."
+            )
+        elif not n:
+            print("No quarantined legacy rules found.")
 
     elif action == "flush":
         session_path, session_id, cwd = _digest_session(args)
@@ -1720,12 +1795,10 @@ def cmd_digest(args):
         print(f"Digest flushed: {added} new, {upvoted} reinforced, {rejected} rejected.")
 
     elif action == "recover":
-        cwd = getattr(args, "cwd", None) or os.getcwd()
         synced = recover_digest(project_dir=cwd)
         print(f"Synced {synced} rules to Claude Code memory.")
 
     elif action == "inject":
-        cwd = getattr(args, "cwd", None) or os.getcwd()
         # The SessionStart hook calls `digest inject --session "$TRANSCRIPT"`, and
         # runs as a child of the live Claude process — the one moment we can learn
         # CC's own active session. Record it (keyed by the live Claude PID) so the
@@ -1737,20 +1810,20 @@ def cmd_digest(args):
                 record_active_transcript(_transcript)
             except Exception:
                 pass
-        store = load_digest_store(cwd)
-        if store.is_empty():
+        scoped = load_scoped(cwd)
+        own_active = scoped.own.active_rules()
+        shared_active = [r for r in scoped.shared.active_rules() if r.shared]
+        if not own_active and not shared_active:
             print("No rules to inject.")
             return
-        from .digest import sync_to_memdir, _get_memdir
-        synced = sync_to_memdir(store, cwd=cwd)
+        synced = sync_to_memdir(scoped.own, cwd=cwd, shared_store=scoped.shared)
         if synced > 0:
-            save_digest_store(store)
+            save_scoped(
+                scoped,
+                own=bool(scoped.own.active_rules()),
+                shared=bool(scoped.active_shared()),
+            )
             print(f"Synced {synced} active rules to Claude Code memory.")
-        elif not store.active_rules():
-            # Nothing ACTIVE to write yet (rules activate after 2 occurrences) — the
-            # memory-dir state is irrelevant here. The old code mislabeled this as
-            # "Could not find Claude Code memory directory".
-            print("No active rules to sync yet.")
         elif _get_memdir(cwd) is None:
             # We DO have active rules, but Claude Code hasn't created the memory dir
             # for this project yet — it syncs automatically once the dir exists.
@@ -1899,10 +1972,17 @@ def build_parser() -> argparse.ArgumentParser:
     # digest
     p_digest = sub.add_parser("digest", help="Manage behavioral correction rules")
     p_digest.add_argument("digest_action", nargs="?", default="show",
-                          choices=["show", "update", "clear", "flush", "recover", "inject"],
-                          help="Action: show (default), update, clear, flush, recover, inject")
+                          choices=["show", "update", "clear", "flush", "recover", "inject",
+                                   "share", "unshare", "adopt"],
+                          help="Action: show (default), update, clear, flush, recover, "
+                               "inject, share, unshare, adopt")
+    p_digest.add_argument("rule_ids", nargs="*",
+                          help="Rule IDs for share/unshare (e.g. R001 R002)")
     p_digest.add_argument("--session", help=session_help)
     p_digest.add_argument("--cwd", help="Working directory (default: current)")
+    p_digest.add_argument("--shared", action="store_true",
+                          help="share/adopt: into this config's cross-project shared "
+                               "store; clear: also remove the shared store")
 
     p_dash = sub.add_parser("dashboard", help="Generate + open the prune-value dashboard (HTML)")
     p_dash.add_argument("--no-open", action="store_true",
